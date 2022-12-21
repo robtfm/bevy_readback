@@ -403,7 +403,7 @@ fn queue_requests<T: ReadbackComponent>(
         let source = component.readback_source();
 
         let pipeline = pipelines.specialize(&mut cache, &pipeline, ());
-        let size = T::Result::min_size().get();
+        let size = T::Result::SHADER_SIZE.get();
 
         commands.spawn(ComputePhaseItem {
             pipeline,
