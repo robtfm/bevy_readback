@@ -12,7 +12,8 @@ use bevy::{
     },
 };
 use bevy_readback::{
-    ComputeRequest, ComputeRequestToken, ReadbackComponent, ReadbackComponentPlugin, ReadbackPlugin,
+    ComputeError, ComputeRequest, ComputeRequestToken, ReadbackComponent, ReadbackComponentPlugin,
+    ReadbackPlugin,
 };
 
 pub const NEXT_FRAME: bool = true;
@@ -63,24 +64,25 @@ fn run_compute_requests(
             // will complete immediately before proper pipelining is implemented
             // will complete after render is complete with proper pipelining
             match req.get(*t) {
-                Some(res) => {
+                Ok(res) => {
                     info!("[{}] got response: {}", frame.0, res);
                     *token = None;
                     *counter = res;
                 }
-                None => (),
+                Err(_) => panic!(),
             }
         } else {
             // non-blocking request,
-            // will be F+2 before proper pipelining
+            // seems to be F+2 before proper pipelining
             // will be F+? after proper pipelining
             match req.try_get(*t) {
-                Some(res) => {
+                Ok(res) => {
                     info!("[{}] got response: {}", frame.0, res);
                     *token = None;
                     *counter = res;
                 }
-                None => (),
+                Err(ComputeError::NotReady) => (),
+                Err(ComputeError::Failed) => panic!(),
             }
         }
     }

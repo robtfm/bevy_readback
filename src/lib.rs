@@ -2,8 +2,8 @@ use std::{
     borrow::Cow,
     marker::PhantomData,
     sync::{
-        mpsc::{RecvError, TryRecvError},
-        Mutex,
+        mpsc::{sync_channel, Receiver, SyncSender, TryRecvError},
+        Arc, RwLock,
     },
 };
 
@@ -11,12 +11,13 @@ use bevy::{
     ecs::system::{SystemParam, SystemParamItem},
     prelude::*,
     render::{
+        extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_graph::{Node, RenderGraph},
         render_resource::{
             encase::private::{BufferRef, ReadFrom, Reader},
             BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, Buffer,
             BufferDescriptor, BufferUsages, CachedComputePipelineId, ComputePassDescriptor,
-            ComputePipelineDescriptor, MapMode, PipelineCache, ShaderRef, ShaderType,
+            ComputePipelineDescriptor, MapMode, PipelineCache, ShaderRef, ShaderSize, ShaderType,
             SpecializedComputePipeline, SpecializedComputePipelines,
         },
         renderer::RenderDevice,
@@ -25,8 +26,12 @@ use bevy::{
     utils::HashMap,
 };
 
-// chunk size for data returned from render world to main world via channel
+// chunk size for reading from buffer
 pub const BLOCK_SIZE: usize = 1024;
+
+// specify whether to force buffer map for next frame
+#[derive(Resource)]
+pub struct ReadbackPollDevice(bool);
 
 #[derive(Default)]
 pub struct ReadbackPlugin {
@@ -48,15 +53,14 @@ impl Plugin for ReadbackPlugin {
         app.init_resource::<ComputeRequestTokenDispenser>();
 
         let render_app = app.sub_app_mut(RenderApp);
-        render_app.add_system_to_stage(RenderStage::Cleanup, map_buffers);
+        render_app.insert_resource(ReadbackPollDevice(self.poll_device));
 
         let node = ComputeNode::new(&mut render_app.world);
         let mut graph = render_app.world.resource_mut::<RenderGraph>();
         graph.add_node("readback", node);
 
-        if self.poll_device {
-            render_app.add_system_to_stage(RenderStage::Cleanup, poll_device.after(map_buffers));
-        }
+        render_app.add_system_to_stage(RenderStage::Cleanup, map_buffers);
+        render_app.add_system_to_stage(RenderStage::Cleanup, poll_device.after(map_buffers));
     }
 }
 
@@ -75,11 +79,13 @@ impl<T: ReadbackComponent> Default for ReadbackComponentPlugin<T> {
 impl<T: ReadbackComponent> Plugin for ReadbackComponentPlugin<T> {
     fn build(&self, app: &mut App) {
         app.init_resource::<ComputeRequests<T>>();
-        app.init_resource::<ComputeResponses<T>>();
-        app.add_system_to_stage(CoreStage::First, clear_requests::<T>);
+        app.init_non_send_resource::<ComputeResponses<T>>();
+        app.init_resource::<BufferPool<T>>();
+        app.add_plugin(ExtractResourcePlugin::<BufferPool<T>>::default());
+        app.add_system_to_stage(CoreStage::First, cleanup::<T>);
 
         let render_app = app.sub_app_mut(RenderApp);
-        render_app.init_resource::<RenderComputeRequests<T>>();
+        render_app.init_resource::<GpuComputeRequests<T>>();
         render_app.init_resource::<ReadbackComputePipeline<T>>();
         render_app.init_resource::<SpecializedComputePipelines<ReadbackComputePipeline<T>>>();
         render_app.add_system_to_stage(RenderStage::Extract, extract_requests::<T>);
@@ -90,7 +96,7 @@ impl<T: ReadbackComponent> Plugin for ReadbackComponentPlugin<T> {
 pub trait ReadbackComponent: 'static + Component + Send + Sync {
     type SourceData: Send + Sync;
     type RenderData: Send + Sync;
-    type Result: Send + Sync + ShaderType + ReadFrom + Default;
+    type Result: Send + Sync + ShaderType + ShaderSize + ReadFrom + Default;
 
     type PrepareParam: SystemParam;
 
@@ -159,9 +165,43 @@ impl ComputeRequestTokenDispenser {
     }
 }
 
+enum BufferState {
+    InUse,
+    Free,
+}
+
+struct BufferWithState {
+    buffer: Buffer,
+    state: BufferState,
+}
+
+#[derive(Resource, ExtractResource)]
+pub struct BufferPool<T: ReadbackComponent> {
+    buffers: Vec<Arc<RwLock<BufferWithState>>>,
+    _p: PhantomData<fn(T)>,
+}
+
+impl<T: ReadbackComponent> Default for BufferPool<T> {
+    fn default() -> Self {
+        Self {
+            buffers: Default::default(),
+            _p: Default::default(),
+        }
+    }
+}
+
+impl<T: ReadbackComponent> Clone for BufferPool<T> {
+    fn clone(&self) -> Self {
+        Self {
+            buffers: self.buffers.clone(),
+            _p: self._p,
+        }
+    }
+}
+
 #[derive(Resource)]
 pub struct ComputeRequests<T: ReadbackComponent> {
-    reqs: Vec<(T::SourceData, std::sync::mpsc::SyncSender<[u8; BLOCK_SIZE]>)>,
+    reqs: Vec<(T::SourceData, usize, SyncSender<bool>)>,
 }
 
 impl<T: ReadbackComponent> Default for ComputeRequests<T> {
@@ -174,7 +214,7 @@ impl<T: ReadbackComponent> Default for ComputeRequests<T> {
 
 #[derive(Resource)]
 pub struct ComputeResponses<T: ReadbackComponent> {
-    resps: Mutex<HashMap<ComputeRequestToken<T>, std::sync::mpsc::Receiver<[u8; BLOCK_SIZE]>>>,
+    resps: HashMap<ComputeRequestToken<T>, (usize, Receiver<bool>)>,
 }
 
 impl<T: ReadbackComponent> Default for ComputeResponses<T> {
@@ -188,86 +228,133 @@ impl<T: ReadbackComponent> Default for ComputeResponses<T> {
 #[derive(SystemParam)]
 pub struct ComputeRequest<'w, 's, T: ReadbackComponent> {
     dispenser: ResMut<'w, ComputeRequestTokenDispenser>,
-    requests: NonSendMut<'w, ComputeRequests<T>>,
+    requests: ResMut<'w, ComputeRequests<T>>,
     responses: NonSendMut<'w, ComputeResponses<T>>,
+    pool: ResMut<'w, BufferPool<T>>,
+    render_device: Res<'w, RenderDevice>,
     #[system_param(ignore)]
     _p: PhantomData<fn(&'s T)>,
 }
 
+trait ConstSize {
+    const SIZE: usize;
+}
+
+impl<'w, 's, T: ReadbackComponent> ConstSize for ComputeRequest<'w, 's, T> {
+    const SIZE: usize = <T::Result as ShaderSize>::SHADER_SIZE.get() as usize;
+}
+
 fn num_blocks<T: ReadbackComponent>() -> usize {
-    (T::Result::min_size().get() as f32 / BLOCK_SIZE as f32).ceil() as usize
+    (T::Result::SHADER_SIZE.get() as f32 / BLOCK_SIZE as f32).ceil() as usize
+}
+
+pub enum ComputeError {
+    NotReady,
+    Failed,
 }
 
 impl<'w, 's, T: ReadbackComponent> ComputeRequest<'w, 's, T> {
     pub fn request(&mut self, data: T::SourceData) -> ComputeRequestToken<T> {
         let token = self.dispenser.next();
-        let (sender, receiver) = std::sync::mpsc::sync_channel(num_blocks::<T>());
-        self.requests.reqs.push((data, sender));
-        self.responses.resps.lock().unwrap().insert(token, receiver);
+        let next = self
+            .pool
+            .buffers
+            .iter()
+            .enumerate()
+            .find(|(_, b)| matches!(b.read().unwrap().state, BufferState::Free));
+
+        let ix = match next {
+            None => {
+                // info!("creating new buffer {}", self.pool.buffers.len());
+                let size = (BLOCK_SIZE * num_blocks::<T>()) as u64;
+                let buffer = self.render_device.create_buffer(&BufferDescriptor {
+                    label: None,
+                    size,
+                    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+
+                let ix = self.pool.buffers.len();
+                self.pool
+                    .buffers
+                    .push(Arc::new(RwLock::new(BufferWithState {
+                        buffer,
+                        state: BufferState::InUse,
+                    })));
+                ix
+            }
+            Some((ix, buffer_with_state)) => {
+                buffer_with_state.write().unwrap().state = BufferState::InUse;
+                ix
+            }
+        };
+
+        let (sender, receiver) = sync_channel(1);
+
+        self.requests.reqs.push((data, ix, sender));
+        self.responses.resps.insert(token, (ix, receiver));
         token
     }
 
-    pub fn try_get(&mut self, token: ComputeRequestToken<T>) -> Option<T::Result> {
-        let mut guard = self.responses.resps.lock().unwrap();
-        let Some(receiver) = guard.remove(&token) else { return None; };
+    pub fn try_get(&mut self, token: ComputeRequestToken<T>) -> Result<T::Result, ComputeError> {
+        let Some((ix, receiver)) = self.responses.resps.remove(&token) else {
+            return Err(ComputeError::Failed);
+        };
 
         match receiver.try_recv() {
-            Ok(chunk) => {
-                let mut buffer: Vec<u8> = Vec::with_capacity(T::Result::min_size().get() as usize);
-                buffer.extend_from_slice(&chunk);
-                for _ in 1..num_blocks::<T>() {
-                    let Ok(chunk) = receiver.recv() else {
-                        return None
-                    };
-
-                    buffer.extend_from_slice(&chunk);
-                }
-
-                let mut res = T::Result::default();
-                let mut reader = Reader::new::<T::Result>(&buffer, 0).unwrap();
-                res.read_from(&mut reader);
-                Some(res)
-            }
+            Ok(true) => (),
             Err(TryRecvError::Empty) => {
-                guard.insert(token, receiver);
-                None
+                self.responses.resps.insert(token, (ix, receiver));
+                return Err(ComputeError::NotReady);
             }
-            Err(TryRecvError::Disconnected) => None,
+            _ => return Err(ComputeError::Failed),
         }
+
+        Ok(self.read_buffer(ix))
     }
 
-    pub fn get(&mut self, token: ComputeRequestToken<T>) -> Option<T::Result> {
-        let mut guard = self.responses.resps.lock().unwrap();
-        let Some(receiver) = guard.remove(&token) else { return None; };
+    pub fn get(&mut self, token: ComputeRequestToken<T>) -> Result<T::Result, ComputeError> {
+        let Some((ix, receiver)) = self.responses.resps.remove(&token) else {
+            return Err(ComputeError::Failed);
+        };
 
         match receiver.recv() {
-            Ok(chunk) => {
-                let mut buffer: Vec<u8> = Vec::with_capacity(T::Result::min_size().get() as usize);
-                buffer.extend_from_slice(&chunk);
-                for _ in 1..num_blocks::<T>() {
-                    let Ok(chunk) = receiver.recv() else {
-                        return None
-                    };
-
-                    buffer.extend_from_slice(&chunk);
-                }
-
-                let mut res = T::Result::default();
-                let mut reader = Reader::new::<T::Result>(&buffer, 0).unwrap();
-                res.read_from(&mut reader);
-                Some(res)
-            }
-            Err(RecvError) => None,
+            Ok(true) => (),
+            _ => return Err(ComputeError::Failed),
         }
+
+        Ok(self.read_buffer(ix))
+    }
+
+    fn read_buffer(&mut self, ix: usize) -> T::Result {
+        let mut buffer_with_state = self.pool.buffers[ix].write().unwrap();
+
+        // have to copy to vec because "https://users.rust-lang.org/t/cant-use-generic-parameters-from-outer-function/62390"
+        let size = T::Result::SHADER_SIZE.get() as usize;
+        let mut vec = Vec::with_capacity(size);
+        let view = buffer_with_state.buffer.slice(..).get_mapped_range();
+        while vec.len() < size {
+            vec.extend(view.read::<BLOCK_SIZE>(vec.len()));
+        }
+
+        let mut res = T::Result::default();
+        let mut reader = Reader::new::<T::Result>(&vec, 0).unwrap();
+        res.read_from(&mut reader);
+        drop(view);
+        buffer_with_state.buffer.unmap();
+
+        buffer_with_state.state = BufferState::Free;
+
+        res
     }
 }
 
 #[derive(Resource)]
-pub struct RenderComputeRequests<T: ReadbackComponent> {
-    reqs: Vec<(T::RenderData, std::sync::mpsc::SyncSender<[u8; BLOCK_SIZE]>)>,
+pub struct GpuComputeRequests<T: ReadbackComponent> {
+    reqs: Vec<(T::RenderData, usize, SyncSender<bool>)>,
 }
 
-impl<T: ReadbackComponent> Default for RenderComputeRequests<T> {
+impl<T: ReadbackComponent> Default for GpuComputeRequests<T> {
     fn default() -> Self {
         Self {
             reqs: Default::default(),
@@ -276,18 +363,18 @@ impl<T: ReadbackComponent> Default for RenderComputeRequests<T> {
 }
 
 fn extract_requests<T: ReadbackComponent>(
-    reqs: Extract<NonSend<ComputeRequests<T>>>,
-    mut render_reqs: NonSendMut<RenderComputeRequests<T>>,
+    reqs: Extract<Res<ComputeRequests<T>>>,
+    mut render_reqs: ResMut<GpuComputeRequests<T>>,
 ) {
     render_reqs.reqs.clear();
     render_reqs.reqs.extend(
         reqs.reqs
             .iter()
-            .map(|(source_data, sender)| (T::extract(source_data), sender.clone())),
+            .map(|(source_data, ix, sender)| (T::extract(source_data), *ix, sender.clone())),
     );
 }
 
-fn clear_requests<T: ReadbackComponent>(mut reqs: NonSendMut<ComputeRequests<T>>) {
+fn cleanup<T: ReadbackComponent>(mut reqs: ResMut<ComputeRequests<T>>) {
     reqs.reqs.clear();
 }
 
@@ -296,44 +383,35 @@ struct ComputePhaseItem {
     pipeline: CachedComputePipelineId,
     bindgroup: BindGroup,
     source: Buffer,
-    dest: Buffer,
+    dest: Arc<RwLock<BufferWithState>>,
     size: u64,
-    sender: std::sync::mpsc::SyncSender<[u8; BLOCK_SIZE]>,
+    sender: SyncSender<bool>,
 }
 
 fn queue_requests<T: ReadbackComponent>(
-    mut reqs: ResMut<RenderComputeRequests<T>>,
-    device: Res<RenderDevice>,
+    mut reqs: ResMut<GpuComputeRequests<T>>,
     mut pipelines: ResMut<SpecializedComputePipelines<ReadbackComputePipeline<T>>>,
     pipeline: Res<ReadbackComputePipeline<T>>,
     mut cache: ResMut<PipelineCache>,
     mut commands: Commands,
     param: SystemParamItem<T::PrepareParam>,
+    pool: Res<BufferPool<T>>,
 ) {
-    for (render_data, sender) in reqs.reqs.drain(..) {
+    for (render_data, ix, sender) in reqs.reqs.drain(..) {
         let component = T::prepare(render_data, &pipeline.layout, &param);
         let bindgroup = component.bind_group();
         let source = component.readback_source();
 
         let pipeline = pipelines.specialize(&mut cache, &pipeline, ());
-        let blocky_size = (BLOCK_SIZE * num_blocks::<T>()) as u64;
         let size = T::Result::min_size().get();
-
-        // todo cache buffer
-        let dest = device.create_buffer(&BufferDescriptor {
-            label: None,
-            size: blocky_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         commands.spawn(ComputePhaseItem {
             pipeline,
             bindgroup,
             source,
-            dest,
+            dest: pool.buffers[ix].clone(),
             size,
-            sender: sender.clone(),
+            sender,
         });
     }
 }
@@ -420,7 +498,7 @@ impl Node for ComputeNode {
             render_context.command_encoder.copy_buffer_to_buffer(
                 &item.source,
                 0,
-                &item.dest,
+                &item.dest.read().unwrap().buffer,
                 0,
                 item.size,
             );
@@ -433,27 +511,19 @@ impl Node for ComputeNode {
 fn map_buffers(query: Query<&ComputePhaseItem>) {
     for item in &query {
         let sender = item.sender.clone();
-        let output_buffer = item.dest.clone();
-        let size = item.size;
         item.dest
+            .read()
+            .unwrap()
+            .buffer
             .slice(..)
-            .map_async(MapMode::Read, move |res| match res {
-                Ok(_) => {
-                    let view = output_buffer.slice(..).get_mapped_range();
-                    let mut sent = 0;
-                    while (sent as u64) < size {
-                        let data = view.read::<BLOCK_SIZE>(sent);
-                        if let Err(e) = sender.send(*data) {
-                            warn!("failed to send complete notice: {}", e);
-                        }
-                        sent += BLOCK_SIZE;
-                    }
-                }
-                Err(e) => warn!("failed to map buffer: {}", e),
+            .map_async(MapMode::Read, move |res| {
+                sender.send(res.is_ok()).unwrap();
             });
     }
 }
 
-fn poll_device(device: Res<RenderDevice>) {
-    device.poll(wgpu::Maintain::Wait);
+fn poll_device(device: Res<RenderDevice>, poll: Res<ReadbackPollDevice>) {
+    if poll.0 {
+        device.poll(wgpu::Maintain::Wait);
+    }
 }
