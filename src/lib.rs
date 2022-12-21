@@ -94,10 +94,14 @@ impl<T: ReadbackComponent> Plugin for ReadbackComponentPlugin<T> {
 }
 
 pub trait ReadbackComponent: 'static + Component + Send + Sync {
+    // data used to make a request in main world 
     type SourceData: Send + Sync;
+    // data in render world 
     type RenderData: Send + Sync;
+    // expected result from the shader
     type Result: Send + Sync + ShaderType + ShaderSize + ReadFrom + Default;
 
+    // any params required to prepare data
     type PrepareParam: SystemParam;
 
     fn extract(data: &Self::SourceData) -> Self::RenderData;
@@ -113,6 +117,7 @@ pub trait ReadbackComponent: 'static + Component + Send + Sync {
     fn bind_group_layout_entries() -> Vec<BindGroupLayoutEntry>;
 }
 
+// token handed out when a request is made, used to access results
 #[derive(PartialOrd, Ord)]
 pub struct ComputeRequestToken<T: ReadbackComponent> {
     id: u32,
@@ -154,7 +159,7 @@ impl<T: ReadbackComponent> ComputeRequestToken<T> {
 }
 
 #[derive(Resource, Default)]
-pub struct ComputeRequestTokenDispenser {
+struct ComputeRequestTokenDispenser {
     next: u32,
 }
 
@@ -200,7 +205,7 @@ impl<T: ReadbackComponent> Clone for BufferPool<T> {
 }
 
 #[derive(Resource)]
-pub struct ComputeRequests<T: ReadbackComponent> {
+struct ComputeRequests<T: ReadbackComponent> {
     reqs: Vec<(T::SourceData, usize, SyncSender<bool>)>,
 }
 
@@ -213,7 +218,7 @@ impl<T: ReadbackComponent> Default for ComputeRequests<T> {
 }
 
 #[derive(Resource)]
-pub struct ComputeResponses<T: ReadbackComponent> {
+struct ComputeResponses<T: ReadbackComponent> {
     resps: HashMap<ComputeRequestToken<T>, (usize, Receiver<bool>)>,
 }
 
@@ -225,6 +230,7 @@ impl<T: ReadbackComponent> Default for ComputeResponses<T> {
     }
 }
 
+// system param used to make requests and get responses
 #[derive(SystemParam)]
 pub struct ComputeRequest<'w, 's, T: ReadbackComponent> {
     dispenser: ResMut<'w, ComputeRequestTokenDispenser>,
@@ -234,14 +240,6 @@ pub struct ComputeRequest<'w, 's, T: ReadbackComponent> {
     render_device: Res<'w, RenderDevice>,
     #[system_param(ignore)]
     _p: PhantomData<fn(&'s T)>,
-}
-
-trait ConstSize {
-    const SIZE: usize;
-}
-
-impl<'w, 's, T: ReadbackComponent> ConstSize for ComputeRequest<'w, 's, T> {
-    const SIZE: usize = <T::Result as ShaderSize>::SHADER_SIZE.get() as usize;
 }
 
 fn num_blocks<T: ReadbackComponent>() -> usize {
@@ -254,6 +252,7 @@ pub enum ComputeError {
 }
 
 impl<'w, 's, T: ReadbackComponent> ComputeRequest<'w, 's, T> {
+    // make a new request
     pub fn request(&mut self, data: T::SourceData) -> ComputeRequestToken<T> {
         let token = self.dispenser.next();
         let next = self
@@ -296,6 +295,7 @@ impl<'w, 's, T: ReadbackComponent> ComputeRequest<'w, 's, T> {
         token
     }
 
+    // get a request, if ready
     pub fn try_get(&mut self, token: ComputeRequestToken<T>) -> Result<T::Result, ComputeError> {
         let Some((ix, receiver)) = self.responses.resps.remove(&token) else {
             return Err(ComputeError::Failed);
@@ -313,6 +313,8 @@ impl<'w, 's, T: ReadbackComponent> ComputeRequest<'w, 's, T> {
         Ok(self.read_buffer(ix))
     }
 
+    // get a request, block until ready 
+    // should only be used with a polling plugin
     pub fn get(&mut self, token: ComputeRequestToken<T>) -> Result<T::Result, ComputeError> {
         let Some((ix, receiver)) = self.responses.resps.remove(&token) else {
             return Err(ComputeError::Failed);
@@ -517,6 +519,7 @@ fn map_buffers(query: Query<&ComputePhaseItem>) {
             .buffer
             .slice(..)
             .map_async(MapMode::Read, move |res| {
+                // send notice of completion
                 sender.send(res.is_ok()).unwrap();
             });
     }
