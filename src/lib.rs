@@ -94,9 +94,9 @@ impl<T: ReadbackComponent> Plugin for ReadbackComponentPlugin<T> {
 }
 
 pub trait ReadbackComponent: 'static + Component + Send + Sync {
-    // data used to make a request in main world 
+    // data used to make a request in main world
     type SourceData: Send + Sync;
-    // data in render world 
+    // data in render world
     type RenderData: Send + Sync;
     // expected result from the shader
     type Result: Send + Sync + ShaderType + ShaderSize + ReadFrom + Default;
@@ -159,7 +159,7 @@ impl<T: ReadbackComponent> ComputeRequestToken<T> {
 }
 
 #[derive(Resource, Default)]
-struct ComputeRequestTokenDispenser {
+pub struct ComputeRequestTokenDispenser {
     next: u32,
 }
 
@@ -205,7 +205,7 @@ impl<T: ReadbackComponent> Clone for BufferPool<T> {
 }
 
 #[derive(Resource)]
-struct ComputeRequests<T: ReadbackComponent> {
+pub struct ComputeRequests<T: ReadbackComponent> {
     reqs: Vec<(T::SourceData, usize, SyncSender<bool>)>,
 }
 
@@ -218,7 +218,7 @@ impl<T: ReadbackComponent> Default for ComputeRequests<T> {
 }
 
 #[derive(Resource)]
-struct ComputeResponses<T: ReadbackComponent> {
+pub struct ComputeResponses<T: ReadbackComponent> {
     resps: HashMap<ComputeRequestToken<T>, (usize, Receiver<bool>)>,
 }
 
@@ -313,7 +313,7 @@ impl<'w, 's, T: ReadbackComponent> ComputeRequest<'w, 's, T> {
         Ok(self.read_buffer(ix))
     }
 
-    // get a request, block until ready 
+    // get a request, block until ready
     // should only be used with a polling plugin
     pub fn get(&mut self, token: ComputeRequestToken<T>) -> Result<T::Result, ComputeError> {
         let Some((ix, receiver)) = self.responses.resps.remove(&token) else {
